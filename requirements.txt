@@ -1,0 +1,10 @@
+# Python >= 3.10. Requiere además el binario FFmpeg (con libx264) en el PATH.
+fastapi==0.162.7
+uvicorn[standard]==0.54.0
+python-multipart==0.0.33
+pydantic==2.14.3
+gpxpy==1.6.2
+numpy==2.5.4
+scipy==1.18.1
+pillow==13.0.0
+moderngl==5.13.0
