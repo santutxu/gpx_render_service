@@ -133,6 +133,50 @@ class JobInfo(BaseModel):
     video_url: str | None = None
 
 
+class StoredVideo(BaseModel):
+    """Metadatos persistidos junto a cada MP4 (archivo ``<id>.json``)."""
+
+    video_id: str
+    owner: str | None = Field(default=None, description="Usuario que lo creó (None: anterior al control de acceso).")
+    title: str = Field(description="Nombre del GPX original (sin extensión).")
+    created_at: datetime
+    size_bytes: int
+    duration_s: float
+    width: int
+    height: int
+    options: RenderOptions
+    metrics: TrackMetrics
+
+
+class VideoInfo(StoredVideo):
+    """Vídeo de la biblioteca con sus enlaces."""
+
+    stream_url: str = Field(description="Reproducción en el navegador (admite peticiones Range).")
+    download_url: str = Field(description="Descarga como archivo adjunto.")
+
+
+class VideoList(BaseModel):
+    """Página del listado de vídeos."""
+
+    total: int
+    limit: int
+    offset: int
+    items: list[VideoInfo]
+
+
+class LoginRequest(BaseModel):
+    """Credenciales para abrir sesión desde el navegador."""
+
+    api_key: str = Field(min_length=1, max_length=512)
+
+
+class UserInfo(BaseModel):
+    """Usuario autenticado."""
+
+    name: str
+    is_admin: bool
+
+
 class ErrorResponse(BaseModel):
     """Cuerpo estándar de error."""
 

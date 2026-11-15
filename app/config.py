@@ -98,6 +98,16 @@ class Settings:
     ffmpeg_preset: str = field(default_factory=lambda: os.environ.get("GPX_FFMPEG_PRESET", "medium"))
     ffmpeg_timeout_s: int = field(default_factory=lambda: _env_int("GPX_FFMPEG_TIMEOUT_S", 1800))
 
+    # --- Control de acceso -------------------------------------------------
+    #: ``usuario:clave[,usuario2:clave2[:admin]]``. Vacío → se genera una clave de administrador.
+    api_keys: str = field(default_factory=lambda: os.environ.get("GPX_API_KEYS", ""))
+    auth_disabled: bool = field(
+        default_factory=lambda: os.environ.get("GPX_AUTH_DISABLED", "").lower() in ("1", "true", "yes")
+    )
+    #: Secreto para firmar las sesiones; por defecto se deriva de las claves.
+    session_secret: str = field(default_factory=lambda: os.environ.get("GPX_SESSION_SECRET", ""))
+    session_ttl_s: int = field(default_factory=lambda: _env_int("GPX_SESSION_TTL_S", 12 * 3600))
+
     # --- Almacenamiento ----------------------------------------------------
     output_dir: Path = field(
         default_factory=lambda: Path(

@@ -15,6 +15,7 @@ from .exceptions import GPXRenderError
 from .gpx_processor import ProcessedTrack
 from .renderer_orchestrator import RendererOrchestrator
 from .schemas import JobStatus, RenderOptions
+from .video_library import VideoLibrary
 from .video_compiler import StreamingVideoCompiler
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,8 @@ class Job:
     job_id: str
     options: RenderOptions
     track: ProcessedTrack
+    title: str = "ruta"
+    owner: str | None = None
     status: JobStatus = JobStatus.QUEUED
     progress: float = 0.0
     error: str | None = None
@@ -58,6 +61,10 @@ class JobStore:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def remove(self, job_id: str) -> None:
+        with self._lock:
+            self._jobs.pop(job_id, None)
+
     def update(self, job_id: str, **changes: object) -> None:
         with self._lock:
             job = self._jobs[job_id]
@@ -69,8 +76,9 @@ class JobStore:
 class RenderPipeline:
     """Ejecuta render + compilación de un trabajo dentro de un directorio temporal propio."""
 
-    def __init__(self, store: JobStore, settings: Settings) -> None:
+    def __init__(self, store: JobStore, settings: Settings, library: VideoLibrary) -> None:
         self._store = store
+        self._library = library
         self._settings = settings
         # Limita los renders simultáneos: son intensivos en CPU y disco.
         self._slots = threading.BoundedSemaphore(settings.max_concurrent_renders)
@@ -113,6 +121,17 @@ class RenderPipeline:
                     compiler.feed(frames_dir, payload.frame_count)  # motores que no informan del progreso
                     self._store.update(job_id, status=JobStatus.COMPILING, progress=0.97)
                     video = compiler.finish(payload.frame_count)
+                self._library.register(
+                    job_id,
+                    video,
+                    owner=job.owner,
+                    title=job.title,
+                    options=job.options,
+                    metrics=job.track.metrics,
+                    duration_s=payload.duration_s,
+                    width=payload.width,
+                    height=payload.height,
+                )
             self._store.update(job_id, status=JobStatus.COMPLETED, progress=1.0, video_path=video)
             logger.info("Job %s completado: %s", job_id, video)
         except GPXRenderError as exc:

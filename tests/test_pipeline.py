@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("GPX_MIN_VIDEO_SECONDS", "2")  # vídeos cortos para que las pruebas sean rápidas
 os.environ.setdefault("GPX_FFMPEG_PRESET", "ultrafast")
+os.environ["GPX_API_KEYS"] = "ana:clave-de-ana-0123456789,bob:clave-de-bob-0123456789,root:clave-de-root-012345678:admin"
 os.environ.setdefault("GPX_RENDER_ENGINE", "simulated")  # sin red ni OpenGL en las pruebas
 
 import numpy as np
@@ -44,6 +45,9 @@ def make_gpx(n: int = 300, *, with_time: bool = True, with_ele: bool = True, spi
 
 
 OPTS = RenderOptions()
+ANA = {"Authorization": "Bearer clave-de-ana-0123456789"}
+BOB = {"X-API-Key": "clave-de-bob-0123456789"}
+ROOT = {"Authorization": "Bearer clave-de-root-012345678"}
 
 
 def test_metrics_are_plausible() -> None:
@@ -98,7 +102,7 @@ def test_compile_rejects_gaps(tmp_path) -> None:  # type: ignore[no-untyped-def]
 
 
 def test_api_rejects_bad_uploads() -> None:
-    with TestClient(app) as client:
+    with TestClient(app, headers=ANA) as client:
         r = client.post("/api/v1/render-gpx", files={"file": ("a.txt", b"hola")})
         assert r.status_code == 415
         r = client.post("/api/v1/render-gpx", files={"file": ("a.gpx", b"<gpx><trk>")})
@@ -110,7 +114,7 @@ def test_api_rejects_bad_uploads() -> None:
 
 
 def test_api_end_to_end() -> None:
-    with TestClient(app) as client:  # TestClient ejecuta las background tasks antes de devolver
+    with TestClient(app, headers=ANA) as client:  # TestClient ejecuta las background tasks antes de devolver
         r = client.post(
             "/api/v1/render-gpx",
             files={"file": ("ruta.gpx", make_gpx(), "application/gpx+xml")},
@@ -139,3 +143,83 @@ def test_api_end_to_end() -> None:
     # Los temporales del trabajo han desaparecido
     import glob, tempfile
     assert not glob.glob(os.path.join(tempfile.gettempdir(), f"gpxrender_{job_id}_*"))
+
+
+def test_video_library_lifecycle() -> None:
+    with TestClient(app, headers=ANA) as client:
+        r = client.post(
+            "/api/v1/render-gpx", files={"file": ("Mi ruta+2026.GPX", make_gpx())}, data={"resolution": "720p"}
+        )
+        assert r.status_code == 202, r.text
+        vid = r.json()["job_id"]
+
+        listing = client.get("/api/v1/videos").json()
+        assert listing["total"] >= 1 and listing["items"][0]["video_id"] == vid  # el más reciente primero
+        info = client.get(f"/api/v1/videos/{vid}").json()
+        assert info["title"] == "Mi ruta+2026" and info["size_bytes"] > 0 and info["height"] == 720
+
+        full = client.get(f"/api/v1/videos/{vid}/stream")
+        assert full.status_code == 200 and full.headers["content-disposition"].startswith("inline")
+        part = client.get(f"/api/v1/videos/{vid}/stream", headers={"Range": "bytes=0-99"})
+        assert part.status_code == 206 and len(part.content) == 100
+        down = client.get(f"/api/v1/videos/{vid}/download")
+        assert down.headers["content-disposition"].startswith("attachment") and len(down.content) == info["size_bytes"]
+        assert client.get("/videos").status_code == 200
+
+        assert client.delete(f"/api/v1/videos/{vid}").status_code == 204
+        out = get_settings().output_dir
+        assert not (out / f"{vid}.mp4").exists() and not (out / f"{vid}.json").exists()
+        for url in (f"/api/v1/videos/{vid}", f"/api/v1/videos/{vid}/stream", f"/api/v1/jobs/{vid}"):
+            assert client.get(url).status_code == 404
+        assert client.delete(f"/api/v1/videos/{vid}").status_code == 404
+        assert client.delete("/api/v1/videos/..%2F..%2Fetc%2Fpasswd").status_code == 404
+        assert client.get("/api/v1/videos/not-a-valid-id").status_code == 404
+
+
+def test_access_control() -> None:
+    with TestClient(app) as anon:
+        # Sin credenciales o con credenciales erróneas: 401 en todo lo protegido
+        for method, url in [
+            ("GET", "/api/v1/videos"), ("GET", "/api/v1/auth/me"), ("GET", "/api/v1/jobs/x"),
+            ("DELETE", "/api/v1/videos/" + "0" * 32), ("GET", "/api/v1/videos/" + "0" * 32 + "/stream"),
+        ]:  # fmt: skip
+            r = anon.request(method, url)
+            assert r.status_code == 401 and r.headers["www-authenticate"] == "Bearer", url
+        assert anon.post("/api/v1/render-gpx", files={"file": ("a.gpx", make_gpx())}).status_code == 401
+        assert anon.get("/api/v1/videos", headers={"Authorization": "Bearer clave-incorrecta-000000"}).status_code == 401
+        assert anon.get("/health").status_code == 200 and anon.get("/videos").status_code == 200
+
+        # Ana crea un vídeo
+        r = anon.post("/api/v1/render-gpx", files={"file": ("ana.gpx", make_gpx())}, data={"resolution": "720p"}, headers=ANA)
+        assert r.status_code == 202
+        vid = r.json()["job_id"]
+        assert anon.get("/api/v1/auth/me", headers=ANA).json() == {"name": "ana", "is_admin": False}
+
+        # Bob no lo ve ni puede tocarlo (404: no se revela que existe)
+        assert all(v["video_id"] != vid for v in anon.get("/api/v1/videos", headers=BOB).json()["items"])
+        for url in (f"/api/v1/videos/{vid}", f"/api/v1/videos/{vid}/stream", f"/api/v1/videos/{vid}/download",
+                    f"/api/v1/jobs/{vid}", f"/api/v1/jobs/{vid}/video", f"/api/v1/jobs/{vid}/track"):  # fmt: skip
+            assert anon.get(url, headers=BOB).status_code == 404, url
+        assert anon.delete(f"/api/v1/videos/{vid}", headers=BOB).status_code == 404
+        assert anon.get(f"/api/v1/videos/{vid}", headers=ANA).json()["owner"] == "ana"
+
+        # El administrador lo ve todo
+        assert any(v["video_id"] == vid for v in anon.get("/api/v1/videos", headers=ROOT).json()["items"])
+
+    # Sesión de navegador mediante cookie
+    with TestClient(app) as browser:
+        assert browser.post("/api/v1/auth/login", json={"api_key": "mala-mala-mala-mala"}).status_code == 401
+        r = browser.post("/api/v1/auth/login", json={"api_key": "clave-de-ana-0123456789"})
+        assert r.status_code == 200 and "httponly" in r.headers["set-cookie"].lower()
+        assert "samesite=strict" in r.headers["set-cookie"].lower()
+        assert browser.get(f"/api/v1/videos/{vid}/stream").status_code == 200
+        # Una cookie manipulada no sirve
+        token = browser.cookies.get("gpx_session")
+        forged = "root." + token.split(".", 1)[1]
+        with TestClient(app, cookies={"gpx_session": forged}) as attacker:
+            assert attacker.get("/api/v1/videos").status_code == 401
+        assert browser.post("/api/v1/auth/logout").status_code == 204
+        assert browser.get("/api/v1/videos").status_code == 401
+
+    with TestClient(app, headers=ROOT) as admin:
+        assert admin.delete(f"/api/v1/videos/{vid}").status_code == 204
