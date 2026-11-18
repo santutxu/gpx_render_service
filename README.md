@@ -77,19 +77,20 @@ Vistas:
 ## Control de acceso
 
 - Claves de API (`GPX_API_KEYS` o generadas).
-- Sesión firmada (cookie `gpx_session`, HttpOnly, 12 h, `SameSite=None` para el proxy).
-- Registro abierto o cerrado (`GPX_ALLOW_REGISTRATION`).
+- Sesión firmada (cookie `gpx_session`, HttpOnly, 12 h, `SameSite=Strict` por defecto; `Lax`/`None` configurables para `iframe`).
+- Registro abierto o cerrado (`GPX_ALLOW_REGISTRATION`, limitado a 5 intentos/5 min por IP).
 - **Cambio de contraseña invalida las sesiones activas** (la firma incluye el hash).
 - **Administradores** pueden gestionar cuentas, ver todos los vídeos y eliminar recursos.
+- Cuotas: `GPX_MAX_QUEUED_RENDERS` (8 por defecto), `GPX_MAX_JOBS_PER_USER` (3), `GPX_MAX_STORAGE_BYTES_PER_USER`.
 
 ## Límites y advertencias
 
-- Los trabajos en curso se mantienen en memoria; el servidor se reinicia si se apaga el proceso.
+- Los trabajos en curso se mantienen en memoria pero con purga automática (TTL 24h, máx. 500 terminados).
 - El vídeo final se guarda en `GPX_OUTPUT_DIR` (por defecto `/tmp/gpx_render_output`).
-- Máximo 12 momentos por vídeo; 100 MB por archivo adjunto; foto 3,5 s, clip hasta 10 s.
-- El mapa usa teselas satélite de Esri (atribución en la interfaz) servidas por el servidor (proxy autenticado).
+- Máximo 12 momentos por vídeo; 100 MB por archivo adjunto; foto 3,5 s, clip hasta 10 s. Las imágenes se limitan a 50 MP para evitar bombas de descompresión.
+- El mapa usa teselas satélite de Esri (atribución en la interfaz) servidas por el servidor (proxy autenticado). La caché de teselas tiene límite LRU de 2 GB.
 - No hay recuperación de contraseña ni exportación masiva de datos.
-- El servidor web debe ejecutarse tras un proxy HTTPS si se expone al exterior (la cookie es `SameSite=None; Secure`).
+- El servidor debe ejecutarse tras un proxy HTTPS si se expone al exterior (usar `uvicorn --proxy-headers --forwarded-allow-ips '*'` y `GPX_COOKIE_SAMESITE/SECURE`).
 
 ## Motor gráfico
 
@@ -116,6 +117,13 @@ Motor `terrain3d` (`app/terrain.py` + `app/terrain_engine.py`):
 
 ## Configuración (variables de entorno)
 
-`GPX_MAX_UPLOAD_BYTES`, `GPX_SECONDS_PER_KM`, `GPX_MIN_VIDEO_SECONDS`, `GPX_MAX_VIDEO_SECONDS`,
-`GPX_RENDER_ENGINE`, `GPX_NODE_WORKER_SCRIPT`, `GPX_MAX_CONCURRENT_RENDERS`, `GPX_FFMPEG_BINARY`,
-`GPX_FFMPEG_CRF`, `GPX_FFMPEG_PRESET`, `GPX_OUTPUT_DIR` (ver `app/config.py`).
+Todas con prefijo `GPX_`, ver `app/config.py` (~35 opciones):
+
+`GPX_MAX_UPLOAD_BYTES` (25 MB), `GPX_SECONDS_PER_KM`, `GPX_MIN/MAX_VIDEO_SECONDS`, `GPX_RENDER_ENGINE` (`terrain3d`/`simulated`/`node`), `GPX_RENDER_TIMEOUT_S` (3600 s), `GPX_MAX_CONCURRENT_RENDERS` (2), `GPX_MAX_QUEUED_RENDERS`, `GPX_MAX_JOBS_PER_USER`, `GPX_MAX_STORAGE_BYTES_PER_USER`, `GPX_CINEMATIC_ENABLED`, `GPX_MAX_MOMENTS`, `GPX_IMAGERY_URL/MAX_PX`, `GPX_DEM_URL`, `GPX_TILE_CACHE_DIR`, `GPX_FFMPEG_*`, `GPX_OUTPUT_DIR`, `GPX_DB_PATH`, `GPX_ALLOW_REGISTRATION`, `GPX_COOKIE_SAMESITE` (`strict`/`lax`/`none`), `GPX_COOKIE_SECURE`, `GPX_API_KEYS`, `GPX_SESSION_SECRET`, etc.
+
+## Despliegue con Docker
+
+```bash
+docker build -t gpx-render .
+docker run -p 8000:8000 -v gpx-data:/data -e GPX_API_KEYS=admin:clave1234567890123456:admin gpx-render
+```

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -98,17 +99,54 @@ def _sweep_orphan_partials(directory: Path) -> int:
     return removed
 
 
+_PURGE_INTERVAL_S = 3600  # A-5: purga periódica de trabajos antiguos
+
+
+def _purge_loop(stop: threading.Event) -> None:
+    """Hilo en segundo plano: cada _PURGE_INTERVAL_S purga trabajos terminados antiguos."""
+    while not stop.wait(_PURGE_INTERVAL_S):
+        try:
+            removed = store.purge_old()
+            if removed:
+                logger.info("Purgados %d trabajo(s) antiguos de memoria.", removed)
+        except Exception:  # pragma: no cover
+            logger.exception("Error en purga periódica de trabajos")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Prepara el directorio de salida, avisa si falta FFmpeg y detiene el pipeline al cerrar."""
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     if shutil.which(settings.ffmpeg_binary) is None:
-        logger.warning("FFmpeg ('%s') no está en el PATH: los renders fallarán.", settings.ffmpeg_binary)
+        # intentar fallbacks persistentes antes de avisar
+        found = None
+        for cand in (Path.home() / "bin" / "ffmpeg", Path("/home/user/bin/ffmpeg")):
+            if cand.is_file():
+                found = cand
+                break
+        if found is not None:
+            logger.info("Usando FFmpeg en %s", found)
+        else:
+            try:
+                import imageio_ffmpeg  # type: ignore[import-not-found]
+
+                if Path(imageio_ffmpeg.get_ffmpeg_exe()).is_file():
+                    logger.info("Usando FFmpeg de imageio-ffmpeg: %s", imageio_ffmpeg.get_ffmpeg_exe())
+                else:
+                    raise FileNotFoundError
+            except Exception:
+                logger.warning("FFmpeg ('%s') no está en el PATH: los renders fallarán.", settings.ffmpeg_binary)
     if orphans := await run_in_threadpool(_sweep_orphan_partials, settings.output_dir):
         logger.info("Borrados %d vídeo(s) parciales de arranques anteriores.", orphans)
-    yield
-    # Los renders ya no viven en el threadpool de Starlette: hay que detenerlos aquí.
-    await run_in_threadpool(pipeline.shutdown, settings.shutdown_grace_s)
+    stop = threading.Event()
+    t = threading.Thread(target=_purge_loop, args=(stop,), name="gpxrender-purge", daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        # Los renders ya no viven en el threadpool de Starlette: hay que detenerlos aquí.
+        await run_in_threadpool(pipeline.shutdown, settings.shutdown_grace_s)
 
 
 app = FastAPI(
@@ -129,6 +167,17 @@ async def domain_error_handler(_: Request, exc: GPXRenderError) -> JSONResponse:
         content=ErrorResponse(error=exc.error_code, message=exc.message).model_dump(),
         headers={"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else None,
     )
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    """B-8: normaliza HTTPException a {error, message} manteniendo compatibilidad con {detail}."""
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    code_map = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 413: "payload_too_large", 415: "unsupported_media", 422: "validation_error", 429: "too_many_requests", 502: "bad_gateway", 503: "service_unavailable"}
+    # Devolver ambos formatos para no romper tests/frontend existentes
+    payload = ErrorResponse(error=code_map.get(exc.status_code, "http_error"), message=detail).model_dump()
+    payload["detail"] = detail
+    return JSONResponse(status_code=exc.status_code, content=payload, headers=exc.headers)
 
 
 def _sanitize_title(raw: str | None, fallback_filename: str | None = None) -> str:
@@ -393,6 +442,14 @@ def _start_session(response: Response, request: Request, principal: Principal) -
 
 
 def _client_ip(request: Request) -> str:
+    # B-3: detrás de nginx/Traefik la IP real viene en X-Forwarded-For
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        # primera IP de la lista es la del cliente original
+        return forwarded.split(",")[0].strip()
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
     return request.client.host if request.client else "?"
 
 
@@ -417,14 +474,21 @@ async def auth_config() -> AuthConfig:
 @app.post("/api/v1/auth/register", response_model=UserInfo, status_code=201, tags=["autenticación"])
 def register(data: RegisterRequest, request: Request, response: Response) -> UserInfo:
     """Crea una cuenta e inicia sesión. La primera cuenta del sistema es administradora."""
+    # B-1: limitar intentos de registro por IP (mismo limitador que login)
+    bucket = f"register|{_client_ip(request)}"
+    auth.limiter.check(bucket)
     if not settings.allow_registration:
         raise ForbiddenError("El registro de nuevas cuentas está desactivado.")
     if auth.is_name_reserved(data.username):
+        # cuenta como intento fallido para el limitador
+        auth.limiter.record_failure(bucket)
         raise HTTPException(status_code=409, detail="Ese nombre de usuario no está disponible.")
     try:
         user = auth.users.create_user(data.username, hash_password(data.password))
     except UsernameTakenError:
+        auth.limiter.record_failure(bucket)
         raise HTTPException(status_code=409, detail="Ese nombre de usuario no está disponible.") from None
+    auth.limiter.reset(bucket)
     logger.info("Cuenta creada: %s%s", user.username, " (administrador)" if user.is_admin else "")
     principal = Principal(user.username, user.is_admin, user.id)
     _start_session(response, request, principal)
@@ -487,17 +551,39 @@ def change_password(data: PasswordChange, request: Request, user: Principal = De
 # Administración de usuarios
 # --------------------------------------------------------------------------- #
 def _admin_user_info(account_id: int) -> AdminUserInfo:
-    for info in _all_users():
-        if info.id == account_id:
-            return info
-    raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    # C-3: no escanear toda la biblioteca para un solo usuario
+    account = auth.users.get_user_by_id(account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+    # buscar claves
+    key_count = 0
+    for acc, kc in auth.users.list_users():
+        if acc.id == account_id:
+            key_count = kc
+            break
+    # solo vídeos de este usuario
+    own = [v for v in library.list() if v.owner and v.owner.lower() == account.username.lower()]
+    return AdminUserInfo(
+        id=account.id,
+        username=account.username,
+        is_admin=account.is_admin,
+        created_at=account.created_at,
+        video_count=len(own),
+        api_key_count=key_count,
+        storage_bytes=sum(v.size_bytes for v in own),
+    )
 
 
 def _all_users() -> list[AdminUserInfo]:
+    # B-5: indexar vídeos por propietario para evitar O(usuarios × vídeos)
     videos = library.list()
+    by_owner: dict[str, list] = {}
+    for v in videos:
+        if v.owner:
+            by_owner.setdefault(v.owner.lower(), []).append(v)
     result = []
     for account, key_count in auth.users.list_users():
-        own = [v for v in videos if v.owner and v.owner.lower() == account.username.lower()]
+        own = by_owner.get(account.username.lower(), [])
         result.append(
             AdminUserInfo(
                 id=account.id,
@@ -556,7 +642,9 @@ def admin_delete_user(user_id: int, admin: Principal = Depends(require_admin)) -
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     if account.id == admin.user_id:
         raise HTTPException(status_code=409, detail="No puedes eliminar tu propia cuenta.")
-    owned = lambda owner: owner is not None and owner.lower() == account.username.lower()  # noqa: E731
+    def owned(owner: str | None) -> bool:
+        return owner is not None and owner.lower() == account.username.lower()
+
     jobs = [job for job in store.list() if owned(job.owner)]
     if any(job.status not in (JobStatus.COMPLETED, JobStatus.FAILED) for job in jobs):
         raise HTTPException(status_code=409, detail="El usuario tiene vídeos en proceso. Inténtalo cuando terminen.")
@@ -688,14 +776,25 @@ async def delete_video(video_id: str, user: Principal = Depends(require_user)) -
 
 
 # --------------------------------------------------------------------------- #
-# Aplicación web
+# Seguridad: cabeceras CSP en todas las respuestas (C-9)
 # --------------------------------------------------------------------------- #
 _STATIC_DIR = Path(__file__).parent / "static"
 # Sin scripts ni estilos en línea ni recursos externos: una inyección de HTML no puede ejecutar código.
+# frame-ancestors evita que la app se incruste en iframes de otros orígenes.
 _CSP = (
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
-    "object-src 'none'; base-uri 'self'; form-action 'self'"
+    "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'"
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+    response = await call_next(request)
+    # CSP en todo (incluido /static/*) + anti-clickjacking
+    response.headers.setdefault("Content-Security-Policy", _CSP)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    return response
 
 
 @app.get("/", include_in_schema=False)

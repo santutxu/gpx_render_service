@@ -63,6 +63,28 @@ def _pick_zoom(span: float, max_px: int, max_zoom: int) -> int:
 # --------------------------------------------------------------------------- #
 # Descarga de teselas
 # --------------------------------------------------------------------------- #
+def _enforce_tile_cache_limit(cache_dir: Path, max_bytes: int = 2 * 1024**3) -> None:
+    """B-6: LRU simple - borra las teselas más antiguas si la caché supera el límite (2GB por defecto)."""
+    if not cache_dir.is_dir() or max_bytes <= 0:
+        return
+    try:
+        files = [(p, p.stat()) for p in cache_dir.glob("*.tile")]
+        total = sum(s.st_size for _, s in files)
+        if total <= max_bytes:
+            return
+        files.sort(key=lambda x: x[1].st_mtime)  # más antiguas primero
+        for p, s in files:
+            if total <= max_bytes * 0.8:
+                break
+            try:
+                p.unlink(missing_ok=True)
+                total -= s.st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def fetch_tile_bytes(url: str, cache_dir: Path, timeout: float, retries: int = 3) -> bytes:
     """Descarga (o lee de la caché en disco) una tesela y devuelve sus bytes, ya validados como imagen."""
     cached = cache_dir / (hashlib.sha1(url.encode()).hexdigest() + ".tile")  # noqa: S324 - no criptográfico
@@ -70,6 +92,8 @@ def fetch_tile_bytes(url: str, cache_dir: Path, timeout: float, retries: int = 3
         try:
             data = cached.read_bytes()
             Image.open(io.BytesIO(data)).verify()
+            # tocar mtime para LRU
+            cached.touch(exist_ok=True)
             return data
         except Exception:  # noqa: BLE001 - caché corrupta: se vuelve a descargar
             cached.unlink(missing_ok=True)
@@ -85,6 +109,9 @@ def fetch_tile_bytes(url: str, cache_dir: Path, timeout: float, retries: int = 3
             tmp = cached.with_suffix(f".{time.monotonic_ns()}.tmp")
             tmp.write_bytes(data)
             tmp.replace(cached)  # escritura atómica: seguro con varios renders a la vez
+            # B-6: verificar límite de caché de forma oportunista (cada 100 descargas)
+            if hash(url) % 100 == 0:
+                _enforce_tile_cache_limit(cache_dir)
             return data
         except Exception as exc:  # noqa: BLE001 - red, tiempo de espera o respuesta que no es una imagen
             last = exc

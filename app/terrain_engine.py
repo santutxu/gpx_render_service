@@ -18,6 +18,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .renderer_orchestrator import ProgressCallback
+
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageDraw, ImageFont
@@ -257,7 +259,7 @@ class Terrain3DEngine:
         self._settings = settings
 
     # ------------------------------------------------------------------ #
-    def render(self, payload: RenderPayload, payload_path: Path, frames_dir: Path, on_progress: Any | None) -> None:
+    def render(self, payload: RenderPayload, payload_path: Path, frames_dir: Path, on_progress: ProgressCallback | None = None) -> None:
         try:
             import moderngl
         except ImportError as exc:  # dependencia opcional del motor
@@ -291,7 +293,7 @@ class Terrain3DEngine:
             ctx.release()
 
     # --- Cinemática intro/outro ---------------------------------------
-    def render_intro(self, payload: RenderPayload, frames_dir: Path, on_progress: Any | None) -> None:
+    def render_intro(self, payload: RenderPayload, frames_dir: Path, on_progress: ProgressCallback | None = None) -> None:
         """Intro: 1s hold overview lejano cenital → ~2s zoom al punto de salida con la cámara de inicio (sin salto)."""
         try:
             import moderngl
@@ -348,7 +350,7 @@ class Terrain3DEngine:
         finally:
             ctx.release()
 
-    def render_outro(self, payload: RenderPayload, frames_dir: Path, on_progress: Any | None) -> None:
+    def render_outro(self, payload: RenderPayload, frames_dir: Path, on_progress: ProgressCallback | None = None) -> None:
         """Outro: comienza exactamente donde acaba el tracking → zoom-out a overview lejano + stats."""
         try:
             import moderngl
@@ -406,7 +408,7 @@ class Terrain3DEngine:
             return math.radians(float(payload.frames[0].heading) + cfg.orbit_deg_per_s * t)
         return 0.0
 
-    def _render_cinematic(self, moderngl: Any, ctx: Any, payload: RenderPayload, terrain: TerrainData, targets: FloatArray, eyes: FloatArray, frames_dir: Path, route_color: tuple[float, float, float, float], marker_pos: FloatArray, show_stats: bool = False, stats_start_ratio: float = 0.62, on_progress: Any | None = None) -> None:
+    def _render_cinematic(self, moderngl: Any, ctx: Any, payload: RenderPayload, terrain: TerrainData, targets: FloatArray, eyes: FloatArray, frames_dir: Path, route_color: tuple[float, float, float, float], marker_pos: FloatArray, show_stats: bool = False, stats_start_ratio: float = 0.62, on_progress: ProgressCallback | None = None) -> None:
         w, h = payload.width, payload.height
         cfg = payload.camera
         n = len(targets)
@@ -424,8 +426,11 @@ class Terrain3DEngine:
         th, tw = terrain.texture.shape[:2]
         limit = ctx.info.get("GL_MAX_TEXTURE_SIZE", 4096)
         image = terrain.texture
+        # C-5: mantener proporción al limitar textura (antes se distorsionaba si solo un lado excedía)
         if max(tw, th) > limit:
-            image = np.asarray(Image.fromarray(image).resize((min(tw, limit), min(th, limit))))
+            scale = limit / max(tw, th)
+            new_w, new_h = max(1, int(tw * scale)), max(1, int(th * scale))
+            image = np.asarray(Image.fromarray(image).resize((new_w, new_h), Image.Resampling.LANCZOS))
             th, tw = image.shape[:2]
         texture = ctx.texture((tw, th), 3, np.ascontiguousarray(image).tobytes(), alignment=1)
         texture.build_mipmaps(); texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR); texture.anisotropy = 8.0
@@ -635,7 +640,9 @@ class Terrain3DEngine:
         limit = ctx.info.get("GL_MAX_TEXTURE_SIZE", 4096)
         image = terrain.texture
         if max(tw, th) > limit:
-            image = np.asarray(Image.fromarray(image).resize((min(tw, limit), min(th, limit))))
+            scale = limit / max(tw, th)
+            new_w, new_h = max(1, int(tw * scale)), max(1, int(th * scale))
+            image = np.asarray(Image.fromarray(image).resize((new_w, new_h), Image.Resampling.LANCZOS))
             th, tw = image.shape[:2]
         texture = ctx.texture((tw, th), 3, np.ascontiguousarray(image).tobytes(), alignment=1)
         texture.build_mipmaps()

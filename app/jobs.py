@@ -99,6 +99,36 @@ class JobStore:
         with self._lock:
             self._jobs.pop(job_id, None)
 
+    def purge_old(self, max_age_s: int = 86400, max_keep: int = 500) -> int:
+        """A-5: purga trabajos terminados/fallidos antiguos para evitar fuga de memoria."""
+        now = _now()
+        with self._lock:
+            # ordenar por updated_at descendente
+            sorted_jobs = sorted(self._jobs.values(), key=lambda j: j.updated_at, reverse=True)
+            to_keep = set()
+            # conservar siempre los en curso y los más recientes
+            for j in sorted_jobs:
+                if j.status in (JobStatus.QUEUED, JobStatus.RENDERING, JobStatus.COMPILING):
+                    to_keep.add(j.job_id)
+            # conservar hasta max_keep recientes entre los terminados
+            kept = 0
+            for j in sorted_jobs:
+                if j.job_id in to_keep:
+                    continue
+                age = (now - j.updated_at).total_seconds()
+                if age > max_age_s and kept >= 0:
+                    # más viejo que el límite → purgar si ya tenemos suficientes
+                    continue
+                if kept < max_keep:
+                    to_keep.add(j.job_id)
+                    kept += 1
+            removed = 0
+            for jid in list(self._jobs.keys()):
+                if jid not in to_keep:
+                    self._jobs.pop(jid, None)
+                    removed += 1
+            return removed
+
     def update(self, job_id: str, **changes: object) -> None:
         with self._lock:
             job = self._jobs[job_id]

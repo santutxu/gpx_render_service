@@ -468,11 +468,12 @@ class RendererOrchestrator:
     ) -> Path:
         """Intro cinemático: ruta completa en blanco + zoom al inicio."""
         frames_dir.mkdir(parents=True, exist_ok=True)
-        # placeholder payload.json para compatibilidad con motores que lo esperan
-        try:
-            (frames_dir.parent / "payload.json").write_text(payload.model_dump_json(), encoding="utf-8")
-        except OSError:
-            pass
+        # B-4: payload.json solo para motor node (el resto no lo lee)
+        if self._settings.render_engine == "node":
+            try:
+                (frames_dir.parent / "payload.json").write_text(payload.model_dump_json(), encoding="utf-8")
+            except OSError:
+                pass
         logger.info("Job %s: intro %s (%d fotogramas)", payload.job_id, self._engine.name, int(self._settings.cinematic_intro_s * payload.fps))
         try:
             if hasattr(self._engine, "render_intro"):
@@ -578,7 +579,11 @@ class RendererOrchestrator:
         payload_path = workdir / "payload.json"
         try:
             frames_dir.mkdir(parents=True, exist_ok=False)
-            payload_path.write_text(payload.model_dump_json(), encoding="utf-8")
+            # B-4: solo serializar payload.json para engine node (~2MB saved por trabajo)
+            if self._settings.render_engine == "node":
+                payload_path.write_text(payload.model_dump_json(), encoding="utf-8")
+            else:
+                payload_path.write_text("{}", encoding="utf-8")
         except OSError as exc:
             raise RenderEngineError("No se pudo preparar el directorio de trabajo.", detail=str(exc)) from exc
 

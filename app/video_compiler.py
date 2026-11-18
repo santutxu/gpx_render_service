@@ -30,9 +30,22 @@ def find_ffmpeg(binary: str = "ffmpeg") -> str:
         FFmpegNotFoundError: si no está instalado o no es ejecutable.
     """
     path = shutil.which(binary)
-    if path is None:
-        raise FFmpegNotFoundError(f"FFmpeg no está disponible ('{binary}' no se encuentra en el PATH).")
-    return path
+    if path is not None:
+        return path
+    # Fallback persistente: binario en ~/bin (supervive a reinicios del sandbox; se instala vía johnvansickle)
+    for cand in (Path.home() / "bin" / "ffmpeg", Path("/home/user/bin/ffmpeg")):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    # Fallback: imageio-ffmpeg (no persistente, solo si está instalado)
+    try:
+        import imageio_ffmpeg  # type: ignore[import-not-found]
+
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        if ff and Path(ff).is_file():
+            return ff
+    except Exception:
+        pass
+    raise FFmpegNotFoundError(f"FFmpeg no está disponible ('{binary}' no se encuentra en el PATH).")
 
 
 def _count_frames(frames_dir: Path) -> int:

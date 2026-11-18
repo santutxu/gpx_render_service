@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
+import os
+import pathlib
 from collections.abc import Iterator
+
+# Asegurar que ffmpeg/ffprobe de ~/bin (persistente) estén en PATH para los tests
+# (el binario se descarga vía johnvansickle y sobrevive a reinicios; imageio-ffmpeg no persiste)
+_bin = str(pathlib.Path.home() / "bin")
+if _bin not in os.environ.get("PATH", ""):
+    # inyectar al inicio para que shutil.which y subprocess lo encuentren
+    os.environ["PATH"] = _bin + ":" + os.environ.get("PATH", "")
+    # también /home/user/bin explícito por si HOME no es /home/user
+    alt = "/home/user/bin"
+    if alt != _bin and alt not in os.environ["PATH"]:
+        os.environ["PATH"] = alt + ":" + os.environ["PATH"]
 
 import pytest
 

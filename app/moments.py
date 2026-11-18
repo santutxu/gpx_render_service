@@ -112,15 +112,29 @@ def _sniff(head: bytes) -> tuple[str, str | None]:
 
 
 def _prepare_image(raw: Path, dest: Path) -> tuple[int, int]:
-    """Recodifica la foto a JPEG (sin metadatos, orientación aplicada, tamaño acotado)."""
+    """Recodifica la foto a JPEG (sin metadatos, orientación aplicada, tamaño acotado). B-7: limita bomba de descompresión."""
+    # B-7: Pillow por defecto permite 178M píxeles (~500MB RAM); lo bajamos y usamos draft
+    Image.MAX_IMAGE_PIXELS = 50_000_000  # ~50 MP, suficiente para fotos 8K
     try:
         with Image.open(raw) as img:
+            # draft reduce memoria antes de decodificar (para JPEG)
+            if hasattr(img, "draft"):
+                try:
+                    img.draft("RGB", (_MAX_IMAGE_SIDE, _MAX_IMAGE_SIDE))
+                except Exception:
+                    pass
+            # verifica que la imagen no sea una bomba antes de decodificar completa
+            w, h = img.size
+            if w * h > Image.MAX_IMAGE_PIXELS:
+                raise InvalidMomentError(f"La imagen es demasiado grande ({w}×{h} px). Máximo {Image.MAX_IMAGE_PIXELS} píxeles.")
             img = ImageOps.exif_transpose(img)
             img = img.convert("RGB")
             img.thumbnail((_MAX_IMAGE_SIDE, _MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
             img.save(dest, format="JPEG", quality=92)
             return img.size
-    except Exception as exc:  # noqa: BLE001 - imagen corrupta, truncada o "bomba" de descompresión
+    except InvalidMomentError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - imagen corrupta, truncada
         raise InvalidMomentError("La imagen está dañada o no se puede leer.", detail=repr(exc)) from exc
 
 
